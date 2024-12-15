@@ -1,0 +1,539 @@
+# ks_fnn2d_train.py
+
+import argparse
+import json
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy.io
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from torch.autograd.functional import jvp
+
+# =========================
+#        Seed Setup
+# =========================
+
+# Parse seed argument for reproducibility
+parser = argparse.ArgumentParser(description="Set random seed for reproducibility.")
+parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
+args = parser.parse_args()
+
+# # Use the seed
+seed = args.seed
+
+# Set random seeds for reproducibility
+torch.manual_seed(seed)
+np.random.seed(seed)
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# =========================
+#        Data Loader
+# =========================
+
+class DataLoader1D(object):
+    def __init__(self, x_data, y_data, nx=128, nt=100, sub=1, sub_t=1, new=True):
+        """
+        Initializes a 1D DataLoader.
+
+        Args:
+            x_data (torch.Tensor): Input spatial data.
+            y_data (torch.Tensor): Target temporal data.
+            nx (int): Number of spatial points.
+            nt (int): Number of temporal points.
+            sub (int): Spatial subsampling factor.
+            sub_t (int): Temporal subsampling factor.
+            new (bool): Flag to use new time grid.
+        """
+        self.sub = sub
+        self.sub_t = sub_t
+        s = nx
+
+        # Adjust spatial dimension if odd
+        if (s % 2) == 1:
+            s -= 1
+        self.s = s // sub  # Adjusted spatial dimension after subsampling
+
+        self.T = nt // sub_t  # Adjusted temporal dimension after subsampling
+        self.new = new
+        if new:
+            self.T += 1
+
+        # Subsample the data
+        self.x_data = x_data[:, 0:s:sub]
+        self.y_data = y_data[:, 0:self.T:sub_t, 0:s:sub]
+
+    def make_loader(self, n_sample, batch_size, start=0, train=True):
+        """
+        Creates a DataLoader for the specified number of samples.
+
+        Args:
+            n_sample (int): Number of samples to load.
+            batch_size (int): Batch size.
+            start (int): Starting index for sampling.
+            train (bool): Shuffle data if training.
+
+        Returns:
+            DataLoader: PyTorch DataLoader.
+        """
+        Xs = self.x_data[start:start + n_sample]  # Shape: (n_sample, s)
+        ys = self.y_data[start:start + n_sample]  # Shape: (n_sample, T, s)
+
+        if self.new:
+            gridx = torch.linspace(0, 1, self.s, dtype=torch.float32)  # Shape: (s,)
+            gridt = torch.linspace(0, 1, self.T, dtype=torch.float32)  # Shape: (T,)
+        else:
+            gridx = torch.linspace(0, 1, self.s, dtype=torch.float32)  # Shape: (s,)
+            gridt = torch.linspace(0, 1, self.T + 1, dtype=torch.float32)[1:]  # Shape: (T,)
+
+        # Reshape grids
+        gridx = gridx.view(1, 1, self.s).repeat(n_sample, self.T, 1)  # Shape: (n_sample, T, s)
+        gridt = gridt.view(1, self.T, 1).repeat(n_sample, 1, self.s)  # Shape: (n_sample, T, s)
+
+        # Prepare the input data by combining Xs, gridx, and gridt
+        Xs = Xs.reshape(n_sample, 1, self.s).repeat(1, self.T, 1)  # Shape: (n_sample, T, s)
+        input_data = torch.stack([Xs, gridx, gridt], dim=3)  # Shape: (n_sample, T, s, 3)
+
+        # Create TensorDataset and DataLoader
+        dataset = TensorDataset(input_data, ys)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=train)
+
+        print(f"Input shapes -> gridx: {gridx.shape}, gridt: {gridt.shape}, Xs: {Xs.shape}, ys: {ys.shape}")
+        return loader
+
+# =========================
+#        Model Definition
+# =========================
+
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2):
+        """
+        Spectral Convolution Layer using Fourier transforms.
+
+        Args:
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+            modes1 (int): Number of Fourier modes in the first dimension.
+            modes2 (int): Number of Fourier modes in the second dimension.
+        """
+        super(SpectralConv2d, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.scale = 1 / (in_channels * out_channels)
+        
+        # Initialize spectral weights
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
+        )
+        self.weights2 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
+        )
+
+    def forward(self, x):
+        """
+        Forward pass for spectral convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batchsize, in_channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor after spectral convolution.
+        """
+        batchsize = x.shape[0]
+        size1, size2 = x.shape[-2], x.shape[-1]
+
+        # Fourier transform
+        x_ft = torch.fft.rfft2(x)  # Shape: (batch, in_channels, height, width//2+1)
+
+        # Initialize output in Fourier space
+        out_ft = torch.zeros(
+            batchsize, self.out_channels, size1, size2 // 2 + 1, device=x.device, dtype=torch.cfloat
+        )
+
+        # Apply spectral weights
+        out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum(
+            "bixy,ioxy->boxy", x_ft[:, :, :self.modes1, :self.modes2], self.weights1
+        )
+        out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
+            "bixy,ioxy->boxy", x_ft[:, :, -self.modes1:, :self.modes2], self.weights2
+        )
+
+        # Inverse Fourier transform to return to the spatial domain
+        x = torch.fft.irfft2(out_ft, s=(size1, size2), dim=[2, 3])
+
+        return x
+
+def gelu(x):
+    """Gaussian Error Linear Unit activation."""
+    return 0.5 * x * (1 + torch.erf(x / torch.sqrt(torch.tensor(2.0, dtype=torch.float32))))
+
+
+
+class FNN2d(nn.Module):
+    def __init__(self, modes1, modes2,
+                 width=64, fc_dim=128,
+                 layers=None,
+                 in_dim=3, out_dim=1,
+                 activation='tanh',
+                 pad_x=0, pad_y=0):
+        super(FNN2d, self).__init__()
+
+        """
+        The overall network. It contains 4 layers of the Fourier layer.
+        1. Lift the input to the desire channel dimension by self.fc0 .
+        2. 4 layers of the integral operators u' = (W + K)(u).
+            W defined by self.w; K defined by self.conv .
+        3. Project from the channel space to the output space by self.fc1 and self.fc2 .
+        
+        input: the solution of the coefficient function and locations (a(x, y), x, y)
+        input shape: (batchsize, x=s, y=s, c=3)
+        output: the solution 
+        output shape: (batchsize, x=s, y=s, c=1)
+        """
+
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.width = width
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.padding = (0, 0, 0, pad_y, 0, pad_x)
+        # input channel is 3: (a(x, y), x, y)
+        if layers is None:
+            self.layers = [width] * 4
+        else:
+            self.layers = layers
+        self.fc0 = nn.Linear(in_dim, layers[0])
+
+        self.sp_convs = nn.ModuleList([SpectralConv2d(
+            in_size, out_size, mode1_num, mode2_num)
+            for in_size, out_size, mode1_num, mode2_num
+            in zip(self.layers, self.layers[1:], self.modes1, self.modes2)])
+
+        self.ws = nn.ModuleList([nn.Conv1d(in_size, out_size, 1)
+                                 for in_size, out_size in zip(self.layers, self.layers[1:])])
+
+        self.fc1 = nn.Linear(layers[-1], fc_dim)
+        self.fc2 = nn.Linear(fc_dim, out_dim)
+        if activation =='tanh':
+            self.activation = F.tanh
+        elif activation == 'gelu':
+            self.activation = F.gelu
+        elif activation == 'relu':
+            self.activation == F.relu
+        else:
+            raise ValueError(f'{activation} is not supported')
+
+    def forward(self, x):
+        '''
+        Args:
+            - x : (batch size, x_grid, y_grid, 2)
+        Returns:
+            - x: (batch size, x_grid, y_grid, 1)
+        '''
+        length = len(self.ws)
+        batchsize = x.shape[0]
+        nx, ny = x.shape[1], x.shape[2] # original shape
+        x = F.pad(x, self.padding, "constant", 0)
+        size_x, size_y = x.shape[1], x.shape[2]
+
+        x = self.fc0(x)
+        x = x.permute(0, 3, 1, 2)
+
+        for i, (speconv, w) in enumerate(zip(self.sp_convs, self.ws)):
+            x1 = speconv(x)
+            x2 = w(x.view(batchsize, self.layers[i], -1)).view(batchsize, self.layers[i+1], size_x, size_y)
+            x = x1 + x2
+            if i != length - 1:
+                x = self.activation(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.fc2(x)
+        x = x.reshape(batchsize, size_x, size_y, self.out_dim)
+        x = x[..., :nx, :ny, :]
+        return x
+
+
+# =========================
+#        Residue Computation
+# =========================
+
+def compute_ks_residue_with_jvp(model, input_data):
+    """
+    Computes the residue of the Kuramoto-Sivashinsky (KS) equation using JVP.
+
+    Args:
+        model (nn.Module): The trained FNN2d model.
+        input_data (torch.Tensor): Input tensor of shape (batch, T, s, 3).
+
+    Returns:
+        torch.Tensor: Residue tensor of the KS equation, shape (batch, T, s).
+    """
+
+    # Ensure input_data requires gradients
+    input_data = input_data.requires_grad_(True)
+
+    # Define model function for jvp
+    def model_func(inputs):
+        return model(inputs)
+
+    # Directions for time (t) and space (x) derivatives
+    v_t = torch.zeros_like(input_data)
+    v_t[..., 2] = 1.0  # Direction for time derivative (gridt)
+
+    v_x = torch.zeros_like(input_data)
+    v_x[..., 1] = 1.0  # Direction for spatial derivative (gridx)
+
+    # Compute first-order directional derivatives using jvp
+    outputs = model_func(input_data)  # Shape: (batch, T, s, 1)
+    jvp_t = jvp(model_func, (input_data,), (v_t,), create_graph=True)[1]  # du/dt
+    jvp_x = jvp(model_func, (input_data,), (v_x,), create_graph=True)[1]  # du/dx
+
+    # Nested function to compute the second-order JVP for x
+    def first_order_jvp_x(inputs):
+        return jvp(model_func, (inputs,), (v_x,), create_graph=True)[1]
+
+    # Compute the second-order directional derivatives using jvp on the first-order result
+    jvp_xx = jvp(first_order_jvp_x, (input_data,), (v_x,), create_graph=True)[1]
+
+    # Nested function to compute the third-order JVP for x
+    def second_order_jvp_xx(inputs):
+        return jvp(first_order_jvp_x, (inputs,), (v_x,), create_graph=True)[1]
+
+    # Compute the fourth-order directional derivatives using jvp on the second-order result
+    jvp_xxxx = jvp(second_order_jvp_xx, (input_data,), (v_x,), create_graph=True)[1]
+
+    # Compute the nonlinear term: (1/2) * d(u^2)/dx = u * du/dx
+    nonlinear_term = 0.5 * (2 * outputs * jvp_x)
+
+    # Linear terms
+    linear_term = jvp_xx + jvp_xxxx
+
+    # Compute the full residue of the KS equation
+    residue = jvp_t + nonlinear_term + linear_term
+
+    return residue
+
+# =========================
+#        Data Preparation
+# =========================
+
+# Define the path to your .mat file
+file_path = './data/data.mat'  # Replace with the actual path to your .mat file
+
+# Load data
+data = scipy.io.loadmat(file_path)
+
+# Extract initial conditions and solutions
+U0 = torch.stack([torch.tensor(sol, dtype=torch.float32) for sol in data['init']])
+U = torch.stack([torch.tensor(sol, dtype=torch.float32) for sol in data['solutions']])
+
+# Prepare data
+a = U0.cpu().float()
+# Corrected indexing: U is 3D (n_realizations, T, s). Use [:, :201, :]
+u = U.cpu().float()[:, :201, :]  # Adjust temporal points as needed
+
+print(f"Shape of U: {U.shape}")  # Optional: Verify the shape
+
+nx, nt = u.shape[-1], u.shape[1] - 1
+
+# Initialize DataLoader1D and create train/test loaders
+dataset = DataLoader1D(a, u, nx=nx, nt=nt, sub=1, sub_t=1, new=True)
+train_loader = dataset.make_loader(n_sample=95, batch_size=1, start=0, train=True)
+test_loader = dataset.make_loader(n_sample=5, batch_size=1, start=95, train=False)
+
+# =========================
+#        Training Loop
+# =========================
+
+# Initialize the model
+model = FNN2d(
+    modes1=[30, 30, 30, 30],
+    modes2=[30, 30, 30, 30],
+    width=128,
+    fc_dim=128,
+    layers=[128, 128, 128, 128],
+    pad_x=0,
+    pad_y=0,
+    activation='gelu',
+    in_dim=3,
+    out_dim=1
+).to(device)
+
+# Define loss function and optimizer
+criterion = nn.MSELoss()  # Mean Squared Error Loss for regression
+optimizer = optim.Adam(model.parameters(), lr=5e-4)
+
+# Learning rate scheduler
+scheduler = optim.lr_scheduler.StepLR(
+    optimizer, step_size=20, gamma=0.5
+)
+
+# Initialize lists to store training metrics
+train_losses = []
+validation_losses = []
+relative_l2_errors = []
+computation_times = []
+num_epochs = 150
+
+# Training and validation loop
+for epoch in range(num_epochs):
+    start_time = time.time()  # Record the start time
+    running_loss = 0.0
+
+    # Training phase
+    model.train()  # Set model to training mode
+    for i, (inputs, targets) in enumerate(train_loader):
+        # Move data to the device (GPU/CPU)
+        inputs = inputs.to(device).to(torch.float32)
+        targets = targets.to(device).to(torch.float32)
+
+        # Zero the parameter gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(inputs)  # Shape: (batch, T, s, 1)
+        outputs = outputs.squeeze(-1)  # Shape: (batch, T, s)
+
+        # Compute residue using JVP
+        residue = compute_ks_residue_with_jvp(model, inputs)  # Shape: (batch, T, s)
+
+        # Compute loss: data loss + residual loss
+        loss = criterion(outputs, targets) + criterion(residue, torch.zeros_like(residue))
+
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+
+        # Accumulate loss
+        running_loss += loss.item()
+
+    # Calculate average training loss for the epoch
+    avg_train_loss = running_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+
+    # Validation phase
+    model.eval()  # Set model to evaluation mode
+    l2_errors = []
+    epoch_val_losses = []
+    end_time = time.time()  # Record the end time
+
+    with torch.no_grad():  # Disable gradient computation for validation
+        for input_data, final_target in test_loader:
+            input_data = input_data.to(device).to(torch.float32)
+            final_target = final_target.to(device).to(torch.float32)
+
+            # Predict using the model
+            predicted_output = model(input_data)  # Shape: (batch, T, s, 1)
+            predicted_output = predicted_output.squeeze(-1)  # Shape: (batch, T, s)
+
+            # Compute validation loss
+            val_loss = criterion(predicted_output, final_target).cpu().numpy()
+            epoch_val_losses.append(val_loss)
+
+            # Compute relative L2 error
+            l2_error = torch.norm(predicted_output - final_target, p=2).item() / torch.norm(final_target, p=2).item()
+            l2_errors.append(l2_error)
+
+    # Calculate average validation metrics
+    avg_l2_error = np.mean(l2_errors)
+    avg_val_loss = np.mean(epoch_val_losses)
+    validation_losses.append(avg_val_loss)
+    relative_l2_errors.append(avg_l2_error)
+
+    # Calculate computation time for the epoch
+    computation_times.append(end_time - start_time)
+    print(f"Iteration Time: {end_time - start_time:.2f} seconds")
+
+    # Print training progress
+    print(f"Epoch [{epoch+1}/{num_epochs}], Training Loss: {avg_train_loss:.6f}, "
+          f"Validation Loss: {avg_val_loss:.6f}, Relative L2 Error: {avg_l2_error:.6f}")
+
+    # Update learning rate
+    scheduler.step()
+
+# =========================
+#         Saving Results
+# =========================
+
+# Save training and validation results to a JSON file
+results = {
+    "train_losses": [float(loss) for loss in train_losses],
+    "validation_losses": [float(loss) for loss in validation_losses],
+    "relative_l2_errors": [float(error) for error in relative_l2_errors],
+    "computation_times": [float(time) for time in computation_times]
+}
+
+json_filename = f"results_seed_{seed}.json"
+with open(json_filename, 'w') as json_file:
+    json.dump(results, json_file)
+
+print(f"Training complete. Results saved to {json_filename}.")
+
+# Save the final model
+model_filename = f"fno_model_seed_{seed}.pth"
+torch.save(model.state_dict(), model_filename)
+print(f"Model saved to {model_filename}.")
+
+# =========================
+#         Visualization
+# =========================
+
+def plot_comparison(predicted_output, final_target, extent=(0, 1, 0, 1)):
+    """
+    Plots the original and predicted solutions.
+
+    Args:
+        predicted_output (torch.Tensor): Predicted solution.
+        final_target (torch.Tensor): Original solution.
+        extent (tuple): Extent of the plot axes in the form (xmin, xmax, ymin, ymax).
+    """
+    plt.figure(figsize=(20, 5))
+
+    # Plot the original solution
+    plt.subplot(1, 2, 1)
+    plt.imshow(final_target.cpu().numpy().T, cmap="RdBu", aspect="auto",
+               origin="lower", extent=extent, vmin=-2, vmax=2)
+    plt.colorbar()
+    plt.xlabel("Time")
+    plt.ylabel("Space")
+    plt.title("Original Solution")
+
+    # Plot the predicted solution
+    plt.subplot(1, 2, 2)
+    plt.imshow(predicted_output.cpu().detach().numpy().T, cmap="RdBu", aspect="auto",
+               origin="lower", extent=extent, vmin=-2, vmax=2)
+    plt.colorbar()
+    plt.xlabel("Time")
+    plt.ylabel("Space")
+    plt.title("Model Prediction")
+
+    plt.tight_layout()
+    plt.show()
+
+# Visualize a sample prediction
+print("Generating visualization...")
+model.eval()
+with torch.no_grad():
+    for input_data, final_target in test_loader:
+        input_data = input_data.to(device).float()
+        final_target = final_target.to(device).float()
+
+        # Predict using the model
+        predicted_output = model(input_data)  # Shape: (batch, T, s, 1)
+        predicted_output = predicted_output.squeeze(-1)  # Shape: (batch, T, s)
+
+        # Plot comparison for the first sample in the batch
+        plot_comparison(predicted_output[0], final_target[0], extent=(0, 1, 0, 1))
+        break  # Visualize only the first batch
+
+print("Visualization completed.")
